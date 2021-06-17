@@ -53,17 +53,27 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
     @Override
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
+                            // mode
                             "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                            // 无锁
                             "if (mode == false) then " +
+                                  // set mode write
                                   "redis.call('hset', KEYS[1], 'mode', 'write'); " +
+                                  // 线程标识、计数器
                                   "redis.call('hset', KEYS[1], ARGV[2], 1); " +
+                                  // 锁key过期时间
                                   "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                                   "return nil; " +
                               "end; " +
+                              // 已有写锁
                               "if (mode == 'write') then " +
+                                  // 重入（hash key 是自己）
                                   "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
-                                      "redis.call('hincrby', KEYS[1], ARGV[2], 1); " + 
+                                      // 计数器+1
+                                      "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                                      // 剩余存活时间
                                       "local currentExpire = redis.call('pttl', KEYS[1]); " +
+                                      // 延长过期：当前剩余时间+每次延期时间
                                       "redis.call('pexpire', KEYS[1], currentExpire + ARGV[1]); " +
                                       "return nil; " +
                                   "end; " +
@@ -77,26 +87,41 @@ public class RedissonWriteLock extends RedissonLock implements RLock {
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                // 无锁
                 "if (mode == false) then " +
+					// 发布解锁信息： redisson_rwlock:{key}
                     "redis.call('publish', KEYS[2], ARGV[1]); " +
                     "return 1; " +
                 "end;" +
+                 // 已有写锁
                 "if (mode == 'write') then " +
+					// 是否自己占有
                     "local lockExists = redis.call('hexists', KEYS[1], ARGV[3]); " +
+                    // 不是占有线程
                     "if (lockExists == 0) then " +
                         "return nil;" +
+                    // 当前持有
                     "else " +
+                        // 计数器-1
                         "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
+                        // 减后计数器>0, 延长过期时间
                         "if (counter > 0) then " +
                             "redis.call('pexpire', KEYS[1], ARGV[2]); " +
                             "return 0; " +
+                        // 减后计数器 == 0
                         "else " +
+                            // 删除锁中 线程写锁:write标识
                             "redis.call('hdel', KEYS[1], ARGV[3]); " +
+                            // 如果锁的key数量==1，代表只有一个写锁（只有mode）
                             "if (redis.call('hlen', KEYS[1]) == 1) then " +
+                                // 删除锁key
                                 "redis.call('del', KEYS[1]); " +
-                                "redis.call('publish', KEYS[2], ARGV[1]); " + 
+                                // 发布解锁信息： redisson_rwlock:{key}
+                                "redis.call('publish', KEYS[2], ARGV[1]); " +
+                            // 还有读锁
                             "else " +
                                 // has unlocked read-locks
+                                // 改mode为read
                                 "redis.call('hset', KEYS[1], 'mode', 'read'); " +
                             "end; " +
                             "return 1; "+

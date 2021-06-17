@@ -55,22 +55,40 @@ public class RedissonReadLock extends RedissonLock implements RLock {
     
     @Override
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+        /**
+         * keys[2]: {key}:UUID:threadId:rwlock_timeout
+         */
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                                 "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                                // 没有mode，等于没有锁
                                 "if (mode == false) then " +
+                                  // 加入read的mode
                                   "redis.call('hset', KEYS[1], 'mode', 'read'); " +
+								  // 初始化线程标识、计数器
                                   "redis.call('hset', KEYS[1], ARGV[2], 1); " +
+                                  // set {key}:UUID:threadId:rwlock_timeout:1 1
                                   "redis.call('set', KEYS[2] .. ':1', 1); " +
+                                  // 设置过期时间 {key}:UUID:threadId:rwlock_timeout:1
                                   "redis.call('pexpire', KEYS[2] .. ':1', ARGV[1]); " +
+                                  // 设置key过期时间
                                   "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                                   "return nil; " +
                                 "end; " +
+
+                                // 已有读锁 or 已有当前线程的写锁
                                 "if (mode == 'read') or (mode == 'write' and redis.call('hexists', KEYS[1], ARGV[3]) == 1) then " +
-                                  "local ind = redis.call('hincrby', KEYS[1], ARGV[2], 1); " + 
+                                  // 计数器+1
+                                  "local ind = redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+								  // {key}:UUID:threadId:rwlock_timeout:当前计数
                                   "local key = KEYS[2] .. ':' .. ind;" +
+
+                                  // set {key}:UUID:threadId:rwlock_timeout:当前计数 1
                                   "redis.call('set', key, 1); " +
+								  // 设置过期时间，{key}:UUID:threadId:rwlock_timeout:当前计数
                                   "redis.call('pexpire', key, ARGV[1]); " +
+								  // 剩余时间
                                   "local remainTime = redis.call('pttl', KEYS[1]); " +
+                                  // 延长key过期时间，剩余时间or默认间隔中的max
                                   "redis.call('pexpire', KEYS[1], math.max(remainTime, ARGV[1])); " +
                                   "return nil; " +
                                 "end;" +
@@ -86,45 +104,67 @@ public class RedissonReadLock extends RedissonLock implements RLock {
 
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "local mode = redis.call('hget', KEYS[1], 'mode'); " +
+                // 无锁
                 "if (mode == false) then " +
+                     // 发布解锁消息到 redisson_rwlock_key
                     "redis.call('publish', KEYS[2], ARGV[1]); " +
                     "return 1; " +
                 "end; " +
+                 // 对象是否存在当前线程标识
                 "local lockExists = redis.call('hexists', KEYS[1], ARGV[2]); " +
+				// 不是当前线程持有锁
                 "if (lockExists == 0) then " +
                     "return nil;" +
                 "end; " +
-                    
-                "local counter = redis.call('hincrby', KEYS[1], ARGV[2], -1); " + 
+                // 当前线程持有锁
+                // 计数器-1
+                "local counter = redis.call('hincrby', KEYS[1], ARGV[2], -1); " +
+				// 计数器=0， 删除线程标识hdel
                 "if (counter == 0) then " +
                     "redis.call('hdel', KEYS[1], ARGV[2]); " + 
                 "end;" +
+
+
+                // 删除对象：{key}:UUID:threadId:rwlock_timeout:当前计数
                 "redis.call('del', KEYS[3] .. ':' .. (counter+1)); " +
-                
+
+                // hlen > 1, 即还有其他线程占有读锁or当前线程持有写锁，除了mode，还有其他key
                 "if (redis.call('hlen', KEYS[1]) > 1) then " +
-                    "local maxRemainTime = -3; " + 
+                    "local maxRemainTime = -3; " +
+                        /**
+                         * 其实就是获取所有占有线程中，剩余最大的存活时间,用于给锁延长时间
+                          */
+                    // 获取锁的所有key，并循环
                     "local keys = redis.call('hkeys', KEYS[1]); " + 
-                    "for n, key in ipairs(keys) do " + 
+                    "for n, key in ipairs(keys) do " +
+                        // 获取key的值
                         "counter = tonumber(redis.call('hget', KEYS[1], key)); " + 
-                        "if type(counter) == 'number' then " + 
+                        // 如果值是数字，就是计数器，不是代表mode直接跳过
+                        "if type(counter) == 'number' then " +
+                            // 遍历已有计数值
                             "for i=counter, 1, -1 do " + 
-                                "local remainTime = redis.call('pttl', KEYS[4] .. ':' .. key .. ':rwlock_timeout:' .. i); " + 
-                                "maxRemainTime = math.max(remainTime, maxRemainTime);" + 
+                                // 获取每个{key}:UUID:threadId:rwlock_timeout:当前计数 的剩余存活时间
+                                "local remainTime = redis.call('pttl', KEYS[4] .. ':' .. key .. ':rwlock_timeout:' .. i); " +
+                                // 获取最大的剩余存活时长
+                                "maxRemainTime = math.max(remainTime, maxRemainTime);" +
                             "end; " + 
                         "end; " + 
                     "end; " +
-                            
+
+                     // 使用maxRemainTime为锁key延长时间，然后返回
                     "if maxRemainTime > 0 then " +
                         "redis.call('pexpire', KEYS[1], maxRemainTime); " +
                         "return 0; " +
                     "end;" + 
-                        
+                    // 没有读锁或者全部已过期，还剩下写锁，直接返回
                     "if mode == 'write' then " + 
                         "return 0;" + 
                     "end; " +
                 "end; " +
-                    
+                // 无线程占有or 已占有线程都过期了
+                // 删除锁
                 "redis.call('del', KEYS[1]); " +
+				// 发布解锁消息， redisson_rwlock:key
                 "redis.call('publish', KEYS[2], ARGV[1]); " +
                 "return 1; ",
                 Arrays.<Object>asList(getRawName(), getChannelName(), timeoutPrefix, keyPrefix),
@@ -143,14 +183,16 @@ public class RedissonReadLock extends RedissonLock implements RLock {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "local counter = redis.call('hget', KEYS[1], ARGV[2]); " +
                 "if (counter ~= false) then " +
+                    // 延长锁存活时间
                     "redis.call('pexpire', KEYS[1], ARGV[1]); " +
-                    
+                    // 延长每个{key}:UUID:threadId:rwlock_timeout:当前计数的存活时间
                     "if (redis.call('hlen', KEYS[1]) > 1) then " +
                         "local keys = redis.call('hkeys', KEYS[1]); " + 
                         "for n, key in ipairs(keys) do " + 
                             "counter = tonumber(redis.call('hget', KEYS[1], key)); " + 
                             "if type(counter) == 'number' then " + 
-                                "for i=counter, 1, -1 do " + 
+                                "for i=counter, 1, -1 do " +
+                                    // 延长时间为间隔时间，{key}:UUID:threadId:rwlock_timeout:当前计数
                                     "redis.call('pexpire', KEYS[2] .. ':' .. key .. ':rwlock_timeout:' .. i, ARGV[1]); " + 
                                 "end; " + 
                             "end; " + 

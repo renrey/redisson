@@ -110,6 +110,7 @@ public class RedissonFairLock extends RedissonLock implements RLock {
             return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                     // remove stale threads
                     "while true do " +
+                        //
                         "local firstThreadId2 = redis.call('lindex', KEYS[2], 0);" +
                         "if firstThreadId2 == false then " +
                             "break;" +
@@ -150,79 +151,132 @@ public class RedissonFairLock extends RedissonLock implements RLock {
                     Arrays.asList(getRawName(), threadsQueueName, timeoutSetName),
                     unit.toMillis(leaseTime), getLockName(threadId), currentTime, wait);
         }
+        // 默认执行
 
         if (command == RedisCommands.EVAL_LONG) {
+            /**
+             * KEYS[1]: 锁key
+             * KEYS[2]: （锁的所有）线程队列的key名-threadsQueueName, redisson_lock_queue:{key}，list，所有线程形成队列
+             * KEYS[3]: 超时（线程）集合的key名-timeoutSetName, redisson_lock_timeout:{key}，是zset，score为过期时间
+             *
+             * ARGV[1] : leaseTime过期时间,默认30s
+             * ARGV[2] : getLockName,  当前线程的标识，客户端UUID:threadId
+			 * ARGV[3] : 线程等待实际wait,threadWaitTime , 默认5min
+             * ARGV[4] : 当前时间currentTime
+             */
             return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                     // remove stale threads
                     "while true do " +
+                        // 获取线程队列的队头元素
                         "local firstThreadId2 = redis.call('lindex', KEYS[2], 0);" +
+                        // 无队头，直接break退出循环
                         "if firstThreadId2 == false then " +
                             "break;" +
                         "end;" +
 
+                        // 清除已过期的线程
+                        // 在超时集合中获取当前队头的超时时间（准确的过期时间），通过zscore获取
                         "local timeout = tonumber(redis.call('zscore', KEYS[3], firstThreadId2));" +
+                        // 如果队头已到达超时时间（过期在当前时间前），已过期，出队
                         "if timeout <= tonumber(ARGV[4]) then " +
                             // remove the item from the queue and timeout set
                             // NOTE we do not alter any other timeout
+                            // 队头出队操作
+                            // 删除超时集合zset中的队头的超时信息
                             "redis.call('zrem', KEYS[3], firstThreadId2);" +
+                            // 线程队列list中出队
                             "redis.call('lpop', KEYS[2]);" +
+                        // 队头到了过期时间，退出循环
                         "else " +
                             "break;" +
                         "end;" +
                     "end;" +
 
                     // check if the lock can be acquired now
+                    // 当前无锁
                     "if (redis.call('exists', KEYS[1]) == 0) " +
+                         // 线程队列不存在 or 线程队列队头是当前线程
                         "and ((redis.call('exists', KEYS[2]) == 0) " +
                             "or (redis.call('lindex', KEYS[2], 0) == ARGV[2])) then " +
 
                         // remove this thread from the queue and timeout set
+                        // 从线程队列、超时集合中删除当前线程信息
                         "redis.call('lpop', KEYS[2]);" +
                         "redis.call('zrem', KEYS[3], ARGV[2]);" +
 
                         // decrease timeouts for all waiting in the queue
+                        // 减少所有当前队列元素的过期时间
+                        // 超时集合所有元素下标
                         "local keys = redis.call('zrange', KEYS[3], 0, -1);" +
                         "for i = 1, #keys, 1 do " +
+                            // 每个元素，减去当前时间
                             "redis.call('zincrby', KEYS[3], -tonumber(ARGV[3]), keys[i]);" +
                         "end;" +
 
                         // acquire the lock and set the TTL for the lease
+						// 当前线程占有锁的操作
+                        // 更新占有线程标志hset、初始化计数器
                         "redis.call('hset', KEYS[1], ARGV[2], 1);" +
+                        // 设置key的过期时间
                         "redis.call('pexpire', KEYS[1], ARGV[1]);" +
+                        // 返回成功null加锁成功
                         "return nil;" +
                     "end;" +
 
                     // check if the lock is already held, and this is a re-entry
+                    // 可重入处理，当前线程以占有锁
                     "if redis.call('hexists', KEYS[1], ARGV[2]) == 1 then " +
+                        // 计数器+1
                         "redis.call('hincrby', KEYS[1], ARGV[2],1);" +
+                        // 延长过期时间
                         "redis.call('pexpire', KEYS[1], ARGV[1]);" +
+                        // 返回null，加锁成功
                         "return nil;" +
                     "end;" +
 
                     // the lock cannot be acquired
                     // check if the thread is already in the queue
+                            /**
+                             * 获取锁失败
+                              */
+                    // 超时集合，获取当前线程的超时时间
                     "local timeout = redis.call('zscore', KEYS[3], ARGV[2]);" +
+                    // 已经进入队列（有超时信息）
                     "if timeout ~= false then " +
                         // the real timeout is the timeout of the prior thread
                         // in the queue, but this is approximately correct, and
                         // avoids having to traverse the queue
+                        // 返回需要等待的时间
+                        // 过期时间 - threadWaitTime(5min) - 当前时间
                         "return timeout - tonumber(ARGV[3]) - tonumber(ARGV[4]);" +
                     "end;" +
 
                     // add the thread to the queue at the end, and set its timeout in the timeout set to the timeout of
                     // the prior thread in the queue (or the timeout of the lock if the queue is empty) plus the
                     // threadWaitTime
+                    // 未进入过队列
+                    // 获取队尾信息
                     "local lastThreadId = redis.call('lindex', KEYS[2], -1);" +
                     "local ttl;" +
+
+                    // 计算ttl时长
+                    // 队尾存在 and 队列不是当前线程
                     "if lastThreadId ~= false and lastThreadId ~= ARGV[2] then " +
+                        // 队尾时间 - 当前时间
                         "ttl = tonumber(redis.call('zscore', KEYS[3], lastThreadId)) - tonumber(ARGV[4]);" +
+                    // 队尾不存在（无等待队列） or 队尾是当前线程（已入队）
                     "else " +
+                        // 锁的ttl存活时长
                         "ttl = redis.call('pttl', KEYS[1]);" +
                     "end;" +
+
+                    // 计算过期时间，ttl + threadWaitTime(5min) + 当前时间
                     "local timeout = ttl + tonumber(ARGV[3]) + tonumber(ARGV[4]);" +
+                    // 加入超时集合，再加入线程队列
                     "if redis.call('zadd', KEYS[3], timeout, ARGV[2]) == 1 then " +
                         "redis.call('rpush', KEYS[2], ARGV[2]);" +
                     "end;" +
+                    // 返回ttl
                     "return ttl;",
                     Arrays.asList(getRawName(), threadsQueueName, timeoutSetName),
                     unit.toMillis(leaseTime), getLockName(threadId), wait, currentTime);
@@ -233,43 +287,73 @@ public class RedissonFairLock extends RedissonLock implements RLock {
 
     @Override
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
+        /**
+         * KEYS[4] : 解锁发布的channel名，redisson_lock__channel:{key}
+         * ARGV[1] : 解锁信息，LockPubSub.UNLOCK_MESSAGE,  0
+         * ARGV[2] : 解锁间隔internalLockLeaseTime 30s
+         * ARGV[3] : 线程标识
+         * ARGV[4] : 当前时间
+         */
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 // remove stale threads
                 "while true do "
+                // 队头
                 + "local firstThreadId2 = redis.call('lindex', KEYS[2], 0);"
+                // 无队头，退出循环
                 + "if firstThreadId2 == false then "
                     + "break;"
                 + "end; "
+
+                // 清除已过期的线程
+                // 队头过期时间
                 + "local timeout = tonumber(redis.call('zscore', KEYS[3], firstThreadId2));"
+				// 队头过期时间 在当前时间前，已过期，出队
                 + "if timeout <= tonumber(ARGV[4]) then "
                     + "redis.call('zrem', KEYS[3], firstThreadId2); "
                     + "redis.call('lpop', KEYS[2]); "
+                // 未有过期，退出循环
                 + "else "
                     + "break;"
                 + "end; "
               + "end;"
-                
+
+               // 无锁
               + "if (redis.call('exists', KEYS[1]) == 0) then " + 
-                    "local nextThreadId = redis.call('lindex', KEYS[2], 0); " + 
+                    "local nextThreadId = redis.call('lindex', KEYS[2], 0); " +
+                     // 有队头（还有等待线程），发布解锁信息
                     "if nextThreadId ~= false then " +
+                        // 发布解锁消息，channel为redisson_lock__channel:{key}:队头线程id
                         "redis.call('publish', KEYS[4] .. ':' .. nextThreadId, ARGV[1]); " +
                     "end; " +
+                     // 返回1成功
                     "return 1; " +
                 "end;" +
+
+                // 有锁，不是当前线程持有
                 "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
+					// 返回null，解锁失败
                     "return nil;" +
                 "end; " +
+
+                // 有锁，当前线程持有，重入处理
+                // 计数器-1
                 "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
+                // 计数器还是>0 ,锁未释放完，延长key的过期时间
                 "if (counter > 0) then " +
                     "redis.call('pexpire', KEYS[1], ARGV[2]); " +
+                     // 返回0，重入释放
                     "return 0; " +
                 "end; " +
-                    
+                // 计数器==0，可以释放锁
+                // 删除key
                 "redis.call('del', KEYS[1]); " +
+                // 有队头，发布解锁消息
                 "local nextThreadId = redis.call('lindex', KEYS[2], 0); " + 
                 "if nextThreadId ~= false then " +
+                    // 发布解锁消息，channel为redisson_lock__channel:{key}:队头线程id
                     "redis.call('publish', KEYS[4] .. ':' .. nextThreadId, ARGV[1]); " +
                 "end; " +
+                // 返回1，释放锁成功
                 "return 1; ",
                 Arrays.asList(getRawName(), threadsQueueName, timeoutSetName, getChannelName()),
                 LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime, getLockName(threadId), System.currentTimeMillis());

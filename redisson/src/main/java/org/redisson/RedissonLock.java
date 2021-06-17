@@ -100,6 +100,7 @@ public class RedissonLock extends RedissonBaseLock {
             return;
         }
 
+        // 订阅逻辑，用于获取锁失败，订阅锁的channel，
         RFuture<RedissonLockEntry> future = subscribe(threadId);
         if (interruptibly) {
             commandExecutor.syncSubscriptionInterrupted(future);
@@ -108,13 +109,17 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 尝试获取锁，不成功会一直重试
             while (true) {
                 ttl = tryAcquire(-1, leaseTime, unit, threadId);
                 // lock acquired
+                // ttl为null，获取成功，详细实现的lua脚本返回
                 if (ttl == null) {
                     break;
                 }
 
+                // 需要重试
+                // 利用semaphore进行有限时间，堵塞等待
                 // waiting for message
                 if (ttl >= 0) {
                     try {
@@ -134,6 +139,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            // 执行完成，就不再订阅channel
             unsubscribe(future, threadId);
         }
 //        get(lockAsync(leaseTime, unit));
@@ -171,12 +177,17 @@ public class RedissonLock extends RedissonBaseLock {
 
     private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Long> ttlRemainingFuture;
+        // 指定了等待时间
         if (leaseTime != -1) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
+        // 无指定等待时间，正常默认进入
         } else {
+            // 默认30s(internalLockLeaseTime)
             ttlRemainingFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
                     TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
         }
+        // watchdog机制
+        // 开启后台线程，定时延长key时间
         ttlRemainingFuture.onComplete((ttlRemaining, e) -> {
             if (e != null) {
                 return;
@@ -201,16 +212,33 @@ public class RedissonLock extends RedissonBaseLock {
 
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
+                /**
+                 * KEYS[1]: key
+                 * ARGV[1] : leaseTime过期时间,默认30s
+                 * ARGV[2] : getLockName,  当前线程的标识，客户端UUID:threadId
+                 */
+                // 当前无锁（不存在key）
                 "if (redis.call('exists', KEYS[1]) == 0) then " +
+                        // 添加占有锁的线程标识（客户端UUID:线程id），作为hash对象的hkey
+                        // 初始始化计数器为1，对应hkey的值
                         "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                        // 设置锁（key）过期时间
                         "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                        // 成功返回null
                         "return nil; " +
+
                         "end; " +
+                        // 已有锁，且占有线程是当前线程（根据hkey是否本线程），进行重入处理
                         "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
+                        // hkey计数器+1
                         "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
+                        // 延长key的时间
                         "redis.call('pexpire', KEYS[1], ARGV[1]); " +
+                        // 成功返回null
                         "return nil; " +
                         "end; " +
+
+                        // 获取失败，剩余存活时间ttl
                         "return redis.call('pttl', KEYS[1]);",
                 Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
     }
